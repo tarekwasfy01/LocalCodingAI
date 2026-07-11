@@ -173,3 +173,7 @@ Chats, project information, logs, memory, and training data are stored locally. 
 ## Project status
 
 Local Coding AI is an experimental local development tool. Review generated changes, back up sensitive projects, and periodically inspect collected training data before production use.
+
+## Screenshots:
+<img width="1325" height="1074" alt="Screenshot 2026-07-11 102806" src="https://github.com/user-attachments/assets/08f119d5-6abd-4046-9298-26ea44e5eff7" />
+
