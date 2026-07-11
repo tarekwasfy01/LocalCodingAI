@@ -1,5 +1,5 @@
 <div align="center">
-<img width="576" height="576" alt="app_icon" src="https://github.com/user-attachments/assets/1e6ff690-d171-4381-a149-36d7c4329727" />
+<img width="256" height="256" alt="app_icon" src="https://github.com/user-attachments/assets/1e6ff690-d171-4381-a149-36d7c4329727" />
   <h1>Local Coding AI</h1>
   <p>A local Windows coding assistant with multiple Ollama agents, project access, persistent memory, and optional LoRA training.</p>
 </div>
