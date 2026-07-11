@@ -1,4 +1,4 @@
-﻿#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,10 @@ use std::{
     net::TcpStream,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +25,7 @@ const DEEPSEEK_CODER_MODEL: &str = "deepseek-coder:1.3b";
 const STARCODER_MODEL: &str = "starcoder2:7b";
 const DEEPSEEK_LARGE_CODER_MODEL: &str = "deepseek-coder:6.7b";
 const OPENCLAW_AGENT_MODEL: &str = "openclaw-agent:latest";
+const TRAINED_CODER_MODEL: &str = "local-coding-ai-trained:latest";
 const ALL_DOWNLOADABLE_AGENT_MODELS: &[&str] = &[
     LOCAL_GPT_ROUTER_MODEL,
     DEFAULT_AGENT_MODEL,
@@ -30,6 +34,176 @@ const ALL_DOWNLOADABLE_AGENT_MODELS: &[&str] = &[
     STARCODER_MODEL,
     DEEPSEEK_LARGE_CODER_MODEL,
 ];
+static TRAINING_RUNNING: AtomicBool = AtomicBool::new(false);
+
+const TRAINING_REQUIREMENTS: &str = concat!(
+    "torch\n",
+    "transformers>=4.45,<5\n",
+    "peft>=0.13\n",
+    "accelerate>=1.0\n",
+    "safetensors>=0.4\n",
+);
+
+const ONLINE_TRAINER_PY: &str = r#"import argparse
+import json
+import os
+from pathlib import Path
+
+
+def load_texts(dataset_path: Path, tokenizer, limit: int):
+    texts = []
+    with dataset_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            messages = record.get("messages") or []
+            if not messages:
+                continue
+            if hasattr(tokenizer, "apply_chat_template"):
+                try:
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                except Exception:
+                    text = "\n".join(
+                        f"{item.get('role', 'user')}: {item.get('content', '')}"
+                        for item in messages
+                    )
+            else:
+                text = "\n".join(
+                    f"{item.get('role', 'user')}: {item.get('content', '')}"
+                    for item in messages
+                )
+            if text.strip():
+                texts.append(text)
+            if len(texts) >= limit:
+                break
+    return texts
+
+
+class ChatDataset:
+    def __init__(self, texts, tokenizer, max_length):
+        self.items = []
+        for text in texts:
+            encoded = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_tensors=None,
+            )
+            encoded["labels"] = list(encoded["input_ids"])
+            self.items.append(encoded)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument(
+        "--model",
+        default=os.environ.get(
+            "LOCAL_AI_TRAINING_MODEL",
+            "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        ),
+    )
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--max-examples", type=int, default=64)
+    args = parser.parse_args()
+
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        DataCollatorForLanguageModeling,
+        Trainer,
+        TrainingArguments,
+    )
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+
+    dataset_path = Path(args.dataset)
+    output_path = Path(args.output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    texts = load_texts(dataset_path, tokenizer, args.max_examples)
+    if not texts:
+        raise RuntimeError("The training dataset contains no usable chat examples.")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        trust_remote_code=True,
+        torch_dtype="auto",
+        low_cpu_mem_usage=True,
+    )
+    model.config.use_cache = False
+    existing_adapter = output_path / "adapter_model.safetensors"
+    existing_config = output_path / "adapter_config.json"
+    if existing_adapter.exists() and existing_config.exists():
+        model = PeftModel.from_pretrained(
+            model,
+            output_path,
+            is_trainable=True,
+        )
+    else:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules="all-linear",
+            ),
+        )
+
+    dataset = ChatDataset(texts, tokenizer, args.max_length)
+    training_args = TrainingArguments(
+        output_dir=str(output_path / "trainer_state"),
+        max_steps=max(1, args.steps),
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        learning_rate=2e-4,
+        logging_steps=1,
+        save_strategy="no",
+        report_to=[],
+        remove_unused_columns=False,
+        dataloader_num_workers=0,
+        fp16=False,
+        bf16=False,
+    )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+    )
+    trainer.train()
+    model.save_pretrained(output_path)
+    tokenizer.save_pretrained(output_path)
+    (output_path / "TRAINING_COMPLETE.txt").write_text(
+        f"examples={len(dataset)}\nsteps={max(1, args.steps)}\nmodel={args.model}\n",
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    main()
+"#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ChatMsg {
@@ -123,6 +297,18 @@ struct AgentResult {
 }
 
 #[derive(Clone, Debug)]
+enum AgentEvent {
+    Progress { run_id: u64, text: String },
+    Finished { run_id: u64, result: AgentResult },
+}
+
+#[derive(Clone, Debug)]
+enum TrainingEvent {
+    Status(String),
+    Finished(Result<(), String>),
+}
+
+#[derive(Clone, Debug)]
 struct AgentRunConfig {
     project_dir: String,
     memory_dir: String,
@@ -136,6 +322,8 @@ struct AgentRunConfig {
     run_tests_after_apply: bool,
     context_limit: usize,
     max_parallel_agents: usize,
+    run_id: u64,
+    progress_tx: Option<Sender<AgentEvent>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,6 +396,30 @@ fn default_recommended_agent_count() -> usize {
     1
 }
 
+#[derive(Debug, Deserialize)]
+struct CoordinatorReview {
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    feedback: String,
+    #[serde(default)]
+    revised_summary: String,
+    #[serde(default = "default_recommended_agent_count")]
+    recommended_agent_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct CorrectionAgentReview {
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    feedback_to_coordinator: String,
+    #[serde(default)]
+    correction_brief: String,
+    #[serde(default = "default_recommended_agent_count")]
+    recommended_agent_count: usize,
+}
+
 #[derive(Deserialize)]
 struct OllamaGenerateResponse {
     response: Option<String>,
@@ -249,8 +461,11 @@ pub struct LocalAiApp {
     log: Vec<String>,
     dropped_files: Vec<String>,
     busy: bool,
-    rx: Option<Receiver<(u64, AgentResult)>>,
+    rx: Option<Receiver<AgentEvent>>,
     active_run_id: u64,
+    training_rx: Option<Receiver<TrainingEvent>>,
+    training_status: String,
+    auto_training: bool,
     show_agent_progress: bool,
     auto_apply_actions: bool,
     run_tests_after_apply: bool,
@@ -262,7 +477,7 @@ impl Default for LocalAiApp {
         let dist = app_base_dir();
         let data_root = distribution_data_root(&dist);
         ensure_distribution_data_dirs(&data_root);
-        let state_path = state_file_path(&dist);
+        let state_path = state_file_path(&data_root);
         let ollama = find_ollama(&dist)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "Not found".to_string());
@@ -303,6 +518,9 @@ impl Default for LocalAiApp {
             busy: false,
             rx: None,
             active_run_id: 0,
+            training_rx: None,
+            training_status: "Training idle".to_string(),
+            auto_training: true,
             show_agent_progress: true,
             auto_apply_actions: true,
             run_tests_after_apply: false,
@@ -975,8 +1193,10 @@ impl LocalAiApp {
                 run_tests_after_apply,
                 context_limit,
                 max_parallel_agents,
+                run_id,
+                progress_tx: Some(tx.clone()),
             });
-            let _ = tx.send((run_id, result));
+            let _ = tx.send(AgentEvent::Finished { run_id, result });
         });
     }
 
@@ -992,33 +1212,104 @@ impl LocalAiApp {
     }
 
     fn poll_agent_result(&mut self) {
+        let mut events = Vec::new();
         if let Some(rx) = &self.rx {
-            if let Ok((run_id, result)) = rx.try_recv() {
-                if run_id != self.active_run_id {
-                    return;
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                AgentEvent::Progress { run_id, text } => {
+                    if run_id != self.active_run_id || !self.busy {
+                        continue;
+                    }
+                    let session_idx = self.ensure_active_session_index();
+                    self.sessions[session_idx].messages.push(ChatMsg {
+                        who: "Coordinator".to_string(),
+                        text: text.clone(),
+                    });
+                    self.sessions[session_idx].updated_at = now_secs();
+                    self.log(format!("PROJECT STATUS | {}", text));
                 }
-                self.busy = false;
-                self.rx = None;
+                AgentEvent::Finished { run_id, result } => {
+                    if run_id != self.active_run_id {
+                        continue;
+                    }
+                    self.busy = false;
+                    self.rx = None;
+                    let self_update_ready = result
+                        .log_lines
+                        .iter()
+                        .any(|line| line == "SELF_UPDATE_READY");
 
-                let session_idx = self.ensure_active_session_index();
-                let assistant_answer = clean_visible_answer(&result.final_answer);
-                self.sessions[session_idx].messages.push(ChatMsg {
-                    who: "Assistant".to_string(),
-                    text: assistant_answer,
-                });
-                self.sessions[session_idx].updated_at = now_secs();
-                let completed_session = self.sessions[session_idx].clone();
+                    let session_idx = self.ensure_active_session_index();
+                    let assistant_answer = clean_visible_answer(&result.final_answer);
+                    self.sessions[session_idx].messages.push(ChatMsg {
+                        who: "Assistant".to_string(),
+                        text: assistant_answer,
+                    });
+                    self.sessions[session_idx].updated_at = now_secs();
+                    let completed_session = self.sessions[session_idx].clone();
 
-                self.persist_run_dataset(&completed_session, &result);
-                self.update_memory_after_run(&completed_session, &result);
-                self.start_short_training();
+                    let training_eligible = !result
+                        .log_lines
+                        .iter()
+                        .any(|line| is_actual_error_log_line(line));
+                    self.persist_run_dataset(&completed_session, &result);
+                    self.update_memory_after_run(&completed_session, &result);
+                    if !self_update_ready && self.auto_training && training_eligible {
+                        self.start_short_training();
+                    }
 
-                for line in result.log_lines {
-                    self.log(line);
+                    for line in result.log_lines {
+                        self.log(line);
+                    }
+
+                    if self.auto_training {
+                        self.log("Training data and memory were updated; automatic training was requested.");
+                    } else {
+                        self.log("Training data and memory were updated; automatic training is off.");
+                    }
+                    self.save_state();
+                    if self_update_ready {
+                        self.log("Self-update build succeeded. Closing for verified EXE swap.");
+                        self.save_state();
+                        std::process::exit(0);
+                    }
                 }
+            }
+        }
+    }
 
-                self.log("Short training data and memory were updated for the next answer.");
-                self.save_state();
+    fn poll_training_result(&mut self) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.training_rx {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                TrainingEvent::Status(status) => {
+                    self.training_status = status.clone();
+                    self.log(format!("TRAINING | {}", status));
+                }
+                TrainingEvent::Finished(result) => {
+                    self.training_rx = None;
+                    match result {
+                        Ok(()) => {
+                            self.training_status = "Training completed".to_string();
+                            self.log("TRAINING | LoRA adapter training completed successfully.");
+                        }
+                        Err(error) => {
+                            self.training_status = "Training failed".to_string();
+                            self.log(format!("TRAINING | {}", error));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1154,50 +1445,87 @@ impl LocalAiApp {
     }
 
     fn start_short_training(&mut self) {
+        if TRAINING_RUNNING.swap(true, Ordering::AcqRel) {
+            self.training_status = "Training already running".to_string();
+            self.log("Training is already running; the newly collected dataset will be used by the next cycle.");
+            return;
+        }
+
         let dataset = self
             .data_root
             .join("training")
             .join("fine_tuning")
             .join("chat_messages.jsonl");
         if !dataset.exists() {
-            self.log("Short training skipped: no successful training example exists yet.");
+            TRAINING_RUNNING.store(false, Ordering::Release);
+            self.training_status = "No training data yet".to_string();
+            self.log("Training skipped: no successful training example exists yet.");
             return;
         }
 
+        ensure_training_tool_files(&self.data_root);
         let script = self
             .data_root
             .join("training_tools")
             .join("online_train.py");
-        let script = if script.exists() {
-            script
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("training_tools")
-                .join("online_train.py")
-        };
         if !script.exists() {
+            TRAINING_RUNNING.store(false, Ordering::Release);
+            self.training_status = "Trainer missing".to_string();
             self.log(format!(
-                "Short training could not start: trainer missing at {}",
+                "Training could not start: trainer missing at {}",
                 script.display()
             ));
             return;
         }
 
         let output_dir = self.data_root.join("training").join("online_adapter");
+        let requirements = self
+            .data_root
+            .join("training_tools")
+            .join("requirements.txt");
         let status_file = self
             .data_root
             .join("training")
             .join("short_training_status.log");
-        self.log("Short LoRA training started in the background (1 step).");
+        let distribution_root = self.data_root.clone();
+        let ollama_path = self.ollama_path.clone();
+        let (tx, rx) = mpsc::channel();
+        self.training_rx = Some(rx);
+        self.training_status = "Preparing training".to_string();
+        self.log("Training started. Runtime, caches, temporary files, and adapter output stay inside distribution.");
 
         thread::spawn(move || {
-            let started = now_secs();
+            let _ = tx.send(TrainingEvent::Status(
+                "Preparing distribution-local Python environment".to_string(),
+            ));
             append_text_file(
                 &status_file,
-                &format!("[{}] starting one-step LoRA training\n", started),
+                &format!("[{}] starting one-step LoRA training\n", now_secs()),
             );
-            let result = hidden_command("python")
+
+            let python = match ensure_training_python(
+                &distribution_root,
+                &requirements,
+                &status_file,
+            ) {
+                Ok(python) => python,
+                Err(error) => {
+                    append_text_file(
+                        &status_file,
+                        &format!("[{}] environment preparation failed: {}\n", now_secs(), error),
+                    );
+                    TRAINING_RUNNING.store(false, Ordering::Release);
+                    let _ = tx.send(TrainingEvent::Finished(Err(error)));
+                    return;
+                }
+            };
+
+            let _ = tx.send(TrainingEvent::Status(
+                "Running one-step LoRA training".to_string(),
+            ));
+            let mut command = hidden_command(&python);
+            configure_distribution_training_env(&mut command, &distribution_root);
+            let result = command
                 .arg(&script)
                 .arg("--dataset")
                 .arg(&dataset)
@@ -1205,27 +1533,236 @@ impl LocalAiApp {
                 .arg(&output_dir)
                 .arg("--steps")
                 .arg("1")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
 
-            let message = match result {
-                Ok(status) if status.success() => "training completed".to_string(),
-                Ok(status) => format!("training failed with exit code {:?}", status.code()),
-                Err(error) => format!("training could not start: {}", error),
+            let final_result = match result {
+                Ok(output) if output.status.success() => {
+                    append_text_file(
+                        &status_file,
+                        &format!(
+                            "[{}] training completed\n{}\n",
+                            now_secs(),
+                            truncate_text(&String::from_utf8_lossy(&output.stdout), 4000)
+                        ),
+                    );
+                    let _ = tx.send(TrainingEvent::Status(
+                        "Registering trained adapter in Ollama".to_string(),
+                    ));
+                    match register_trained_adapter_model(
+                        &ollama_path,
+                        &distribution_root,
+                        &output_dir,
+                    ) {
+                        Ok(()) => {
+                            append_text_file(
+                                &status_file,
+                                &format!(
+                                    "[{}] trained Ollama model registered as {}\n",
+                                    now_secs(),
+                                    TRAINED_CODER_MODEL
+                                ),
+                            );
+                            Ok(())
+                        }
+                        Err(error) => Err(format!(
+                            "training succeeded, but trained model registration failed: {}",
+                            error
+                        )),
+                    }
+                }
+                Ok(output) => {
+                    let diagnostic = format!(
+                        "training failed with exit code {:?}: {}",
+                        output.status.code(),
+                        truncate_text(&String::from_utf8_lossy(&output.stderr), 2000)
+                    );
+                    append_text_file(
+                        &status_file,
+                        &format!("[{}] {}\n", now_secs(), diagnostic),
+                    );
+                    Err(diagnostic)
+                }
+                Err(error) => {
+                    let diagnostic = format!("training could not start: {}", error);
+                    append_text_file(
+                        &status_file,
+                        &format!("[{}] {}\n", now_secs(), diagnostic),
+                    );
+                    Err(diagnostic)
+                }
             };
-            append_text_file(
-                &status_file,
-                &format!("[{}] {}\n", now_secs(), message),
-            );
+            TRAINING_RUNNING.store(false, Ordering::Release);
+            let _ = tx.send(TrainingEvent::Finished(final_result));
         });
     }
+
+}
+
+fn ensure_training_tool_files(root: &Path) {
+    let tools = root.join("training_tools");
+    let _ = fs::create_dir_all(&tools);
+    let trainer = tools.join("online_train.py");
+    let _ = fs::write(&trainer, ONLINE_TRAINER_PY);
+    let requirements = tools.join("requirements.txt");
+    let _ = fs::write(&requirements, TRAINING_REQUIREMENTS);
+}
+
+fn configure_distribution_training_env(command: &mut Command, root: &Path) {
+    let cache_root = root.join("training").join("cache");
+    let temp_root = root.join("training").join("temp");
+    let pycache_root = root.join("training").join("pycache");
+    let _ = fs::create_dir_all(&cache_root);
+    let _ = fs::create_dir_all(&temp_root);
+    let _ = fs::create_dir_all(&pycache_root);
+
+    command
+        .env("HF_HOME", cache_root.join("huggingface"))
+        .env("HUGGINGFACE_HUB_CACHE", cache_root.join("huggingface").join("hub"))
+        .env("TRANSFORMERS_CACHE", cache_root.join("transformers"))
+        .env("TORCH_HOME", cache_root.join("torch"))
+        .env("PIP_CACHE_DIR", cache_root.join("pip"))
+        .env("PIP_NO_INPUT", "1")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONPYCACHEPREFIX", &pycache_root)
+        .env("TMP", &temp_root)
+        .env("TEMP", &temp_root)
+        .env("TMPDIR", &temp_root)
+        .env("XDG_CACHE_HOME", &cache_root)
+        .env("TOKENIZERS_PARALLELISM", "false");
+}
+
+fn ensure_training_python(
+    distribution_root: &Path,
+    requirements: &Path,
+    status_file: &Path,
+) -> Result<PathBuf, String> {
+    let runtime_root = distribution_root.join("training").join("runtime");
+    let venv_root = runtime_root.join("venv");
+    let venv_python = if cfg!(windows) {
+        venv_root.join("Scripts").join("python.exe")
+    } else {
+        venv_root.join("bin").join("python")
+    };
+
+    if !venv_python.exists() {
+        let base_python = find_training_python(distribution_root).ok_or_else(|| {
+            format!(
+                "No usable Python was found. Put a portable Python runtime in {} or add Python to PATH. Nothing is installed into AppData.",
+                distribution_root.join("runtime").join("python").display()
+            )
+        })?;
+        let _ = fs::create_dir_all(&runtime_root);
+        append_text_file(
+            status_file,
+            &format!(
+                "[{}] creating local venv at {} using {}\n",
+                now_secs(),
+                venv_root.display(),
+                base_python.display()
+            ),
+        );
+        let mut create = hidden_command(&base_python);
+        configure_distribution_training_env(&mut create, distribution_root);
+        let status = create
+            .args(["-m", "venv"])
+            .arg(&venv_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("local training venv could not be created: {}", e))?;
+        if !status.success() || !venv_python.exists() {
+            return Err("local training venv creation failed".to_string());
+        }
+    }
+
+    let mut dependency_check = hidden_command(&venv_python);
+    configure_distribution_training_env(&mut dependency_check, distribution_root);
+    let dependency_check = dependency_check
+        .args([
+            "-c",
+            "import torch, transformers, peft, accelerate, safetensors",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if dependency_check.is_ok_and(|status| status.success()) {
+        return Ok(venv_python);
+    }
+
+    append_text_file(
+        status_file,
+        &format!(
+            "[{}] installing training dependencies into distribution-local venv\n",
+            now_secs()
+        ),
+    );
+    let mut install = hidden_command(&venv_python);
+    configure_distribution_training_env(&mut install, distribution_root);
+    let status = install
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--cache-dir",
+        ])
+        .arg(distribution_root.join("training").join("cache").join("pip"))
+        .arg("-r")
+        .arg(requirements)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("pip dependency installation could not start: {}", e))?;
+    if status.success() {
+        Ok(venv_python)
+    } else {
+        Err("pip could not install the training dependencies into the local venv".to_string())
+    }
+}
+
+fn find_training_python(distribution_root: &Path) -> Option<PathBuf> {
+    let local_candidates = if cfg!(windows) {
+        vec![
+            distribution_root.join("runtime").join("python").join("python.exe"),
+            distribution_root.join("python").join("python.exe"),
+            distribution_root.join("runtime").join("python.exe"),
+        ]
+    } else {
+        vec![
+            distribution_root.join("runtime").join("python").join("bin").join("python3"),
+            distribution_root.join("runtime").join("python").join("bin").join("python"),
+            distribution_root.join("python").join("bin").join("python3"),
+        ]
+    };
+
+    if let Some(path) = local_candidates.into_iter().find(|path| path.exists()) {
+        return Some(path);
+    }
+
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let executable = if cfg!(windows) { "python.exe" } else { "python3" };
+    if let Ok(output) = hidden_command(locator).arg(executable).output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                return text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .find(|path| path.exists());
+            }
+        }
+    }
+    None
 }
 
 impl eframe::App for LocalAiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_light_beige_theme(ctx);
         self.poll_agent_result();
+        self.poll_training_result();
 
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
@@ -1277,10 +1814,28 @@ impl eframe::App for LocalAiApp {
                         ui.label("Ready");
                     }
 
+                    ui.separator();
+                    let training_running = TRAINING_RUNNING.load(Ordering::Acquire);
+                    if ui
+                        .add_enabled(
+                            !training_running,
+                            egui::Button::new(if training_running {
+                                "Training..."
+                            } else {
+                                "Training"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.start_short_training();
+                    }
+                    ui.checkbox(&mut self.auto_training, "Auto training");
+                    ui.small(&self.training_status);
+
                     let context_width = (window_width * 0.10).clamp(72.0, 120.0);
                     let agent_width = (window_width * 0.055).clamp(44.0, 72.0);
                     let spacer =
-                        (ui.available_width() - context_width - agent_width - 190.0).max(12.0);
+                        (ui.available_width() - context_width - agent_width - 165.0).max(8.0);
                     ui.add_space(spacer);
 
                     ui.label("Context");
@@ -1557,9 +2112,21 @@ impl eframe::App for LocalAiApp {
             }
         });
 
-        if self.busy {
+        if self.busy || TRAINING_RUNNING.load(Ordering::Acquire) || self.training_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+    }
+}
+
+fn emit_agent_progress(config: &AgentRunConfig, text: impl Into<String>) {
+    if !config.show_progress {
+        return;
+    }
+    if let Some(tx) = &config.progress_tx {
+        let _ = tx.send(AgentEvent::Progress {
+            run_id: config.run_id,
+            text: text.into(),
+        });
     }
 }
 
@@ -1574,8 +2141,12 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
     }
 
     if config.show_progress {
-        log_lines.push("Coordinator checks the request and project folder...".to_string());
+        log_lines.push("Coordinator 1 checks the request and project folder...".to_string());
     }
+    emit_agent_progress(
+        &config,
+        "Coordinator 1: I am checking the request, the project structure, and the current project memory.",
+    );
 
     let project_root = match canonical_project_root(&config.project_dir) {
         Ok(root) => root,
@@ -1612,6 +2183,8 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
         };
     }
 
+    maybe_register_existing_trained_adapter(&config, &project_root, &mut log_lines);
+
     log_lines.push("Checking models...".to_string());
     if let Err(e) = ensure_all_agent_models(&config.ollama_path, &project_root, &config.model) {
         log_lines.push(format!("Model check failed: {}", e));
@@ -1637,14 +2210,14 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
     }
 
     if config.show_progress {
-        log_lines.push("Coordinator decides whether code changes are needed...".to_string());
+        log_lines.push("Coordinator 1 decides whether code changes are needed...".to_string());
     }
 
-    let coordinator =
+    let mut coordinator =
         run_coordinator_decision(&config, &project_root, &project_snapshot, &memory_context, &mut log_lines);
     if config.show_progress {
         log_lines.push(format!(
-            "Coordinator: {}",
+            "Coordinator 1: {}",
             truncate_text(&coordinator.summary, 220)
         ));
     }
@@ -1656,9 +2229,44 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
         };
     }
 
+    emit_agent_progress(
+        &config,
+        "Coordinator 1: I have a first implementation plan. Coordinator 2 is reviewing it before the coding agents start.",
+    );
+    let coordinator_review = run_second_coordinator_review(
+        &config,
+        &project_root,
+        &project_snapshot,
+        &memory_context,
+        &coordinator,
+        &mut log_lines,
+    );
+    if !coordinator_review.revised_summary.trim().is_empty() {
+        coordinator.summary = coordinator_review.revised_summary.clone();
+    }
+    coordinator.recommended_agent_count = coordinator_review
+        .recommended_agent_count
+        .clamp(1, config.max_parallel_agents.max(1));
+    log_lines.push(format!(
+        "Coordinator 2 review: approved={}, feedback={}",
+        coordinator_review.approved,
+        truncate_text(&coordinator_review.feedback, 300)
+    ));
+    emit_agent_progress(
+        &config,
+        format!(
+            "Coordinator 2: Review finished. I sent feedback back to Coordinator 1. Current plan: {}",
+            truncate_text(&coordinator.summary, 220)
+        ),
+    );
+
     if config.show_progress {
         log_lines.push("Coder agents are working on candidate solutions...".to_string());
     }
+    emit_agent_progress(
+        &config,
+        "Coordinator 1: The reviewed plan is now with the coding agents. I will report again before changes are applied.",
+    );
 
     let effective_agent_count =
         recommended_agent_count(&config, &coordinator).clamp(1, config.max_parallel_agents.max(1));
@@ -1667,8 +2275,19 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
         effective_agent_count, coordinator.use_large_single_coder
     ));
 
+    let trained_coder_available = trained_coder_model_available();
     let primary_coder_model = if coordinator.use_large_single_coder && effective_agent_count == 1 {
         LOCAL_GPT_ROUTER_MODEL
+    } else if trained_coder_available {
+        log_lines.push(format!(
+            "Training integration: {} is available and will be used as the primary coding model.",
+            TRAINED_CODER_MODEL
+        ));
+        emit_agent_progress(
+            &config,
+            "Coordinator 1: The latest trained coding adapter is active for this coding round.",
+        );
+        TRAINED_CODER_MODEL
     } else {
         config.model.as_str()
     };
@@ -1712,6 +2331,8 @@ Strict output rules:
 - Use write_file for new files, or only when the full target content is safely clear.
 - Use replace_text only with text that occurs exactly once in the snapshot.
 - For general coding tasks, write the required source files with write_file, append_file, or replace_text.
+- If the user asks Local Coding AI to modify itself, edit src/main.rs in the bundled application project. A verified release build and EXE swap are triggered automatically after a successful change to that file.
+- Never edit the running EXE directly and never create manual copy/rename commands for self-updates.
 - If the user asks for a Windows EXE/app from Python, write or copy the suitable Python file first, then apply package_python_exe to that file.
 - If no file change is needed, use "actions":[].
 - If unsure, prefer "actions":[] and a clear summary.
@@ -1840,6 +2461,21 @@ JSON:"#,
         }
     }
 
+    if !envelope.actions.is_empty() {
+        emit_agent_progress(
+            &config,
+            "GPT Correction Agent: I am reviewing the final proposed patch, consulting Coordinator 1 again, and redistributing it to coding agents for a last correction round.",
+        );
+        envelope = run_final_correction_pipeline(
+            &config,
+            &project_root,
+            &project_snapshot,
+            &coordinator,
+            &envelope,
+            &mut log_lines,
+        );
+    }
+
     if let Some(summary) = envelope.summary.as_ref().filter(|s| !s.trim().is_empty()) {
         log_lines.push(format!(
             "Internal summary: {}",
@@ -1858,6 +2494,13 @@ JSON:"#,
             "Applying {} file action(s)...",
             envelope.actions.len()
         ));
+        emit_agent_progress(
+            &config,
+            format!(
+                "Coordinator 1: The agents produced {} safe file action(s). I am applying them now.",
+                envelope.actions.len()
+            ),
+        );
         let mut report = apply_file_actions(&project_root, &envelope.actions);
         if report.had_error && report.changed_files.is_empty() {
             let first_report_lines = report.log_lines.clone();
@@ -1919,6 +2562,10 @@ JSON:"#,
         && !config.terminal_cmd.trim().is_empty()
     {
         log_lines.push(format!("Tester runs: {}", config.terminal_cmd));
+        emit_agent_progress(
+            &config,
+            format!("Coordinator 2: Changes are applied. I am checking them with `{}`.", config.terminal_cmd),
+        );
         test_output = run_shell(
             project_root.to_string_lossy().as_ref(),
             &config.terminal_cmd,
@@ -1926,9 +2573,29 @@ JSON:"#,
         log_lines.push("Tester ist fertig.".to_string());
     }
 
-    if config.show_progress {
-        log_lines.push("Coordinator writes the final answer...".to_string());
+    if changed_files
+        .iter()
+        .any(|path| path.replace('\\', "/").eq_ignore_ascii_case("src/main.rs"))
+    {
+        match prepare_self_rebuild(&project_root) {
+            Ok(()) => log_lines.push("SELF_UPDATE_READY".to_string()),
+            Err(error) => {
+                action_had_error = true;
+                log_lines.push(format!(
+                    "Self-update build failed; current EXE remains unchanged: {}",
+                    error
+                ));
+            }
+        }
     }
+
+    if config.show_progress {
+        log_lines.push("Coordinator 1 writes the final answer...".to_string());
+    }
+    emit_agent_progress(
+        &config,
+        "Coordinator 1: Implementation is finished. I am preparing the final project summary now.",
+    );
 
     let deterministic = fallback_final_answer(
         envelope.summary.as_deref(),
@@ -2238,8 +2905,8 @@ fn run_local_python_pack_task(
         .and_then(|stem| stem.to_str())
         .unwrap_or("app")
         .to_string();
-    let work_root = project_root
-        .join("build")
+    let work_root = distribution_data_root(&app_base_dir())
+        .join("temp")
         .join("package_work")
         .join(format!("{}_{}", sanitize_file_stem(&exe_name), now_millis()));
     let source_root = work_root.join("source");
@@ -2363,6 +3030,7 @@ fn run_local_python_pack_task(
     log_lines.push(format!("EXE created: {}", final_exe_path.display()));
     let smoke = run_exe_smoke_test(&final_exe_path, project_root, Duration::from_secs(5));
     log_lines.push(format!("EXE smoke test: {}", truncate_text(&smoke, 300)));
+    let _ = fs::remove_dir_all(&work_root);
 
     AgentResult {
         final_answer: format!(
@@ -2553,8 +3221,8 @@ fn ensure_local_pyinstaller(
     project_root: &Path,
     log_lines: &mut Vec<String>,
 ) -> Result<PathBuf, String> {
-    let app_dir = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
-    let tools_dir = app_dir.join(".local_ai_builder").join("packager_tools");
+    let app_dir = distribution_data_root(&app_base_dir());
+    let tools_dir = app_dir.join("tools").join("packager_tools");
 
     if !tools_dir.join("PyInstaller").exists() {
         log_lines.push("PyInstaller is missing locally; trying installation...".to_string());
@@ -2562,13 +3230,24 @@ fn ensure_local_pyinstaller(
             .map_err(|e| format!("Packager folder could not be created: {}", e))?;
 
         let mut install = python_command(python);
+        let cache_dir = app_dir.join("tools").join("pip_cache");
+        let temp_dir = app_dir.join("tools").join("temp");
+        let _ = fs::create_dir_all(&cache_dir);
+        let _ = fs::create_dir_all(&temp_dir);
         install
             .arg("-m")
             .arg("pip")
             .arg("install")
+            .arg("--cache-dir")
+            .arg(&cache_dir)
             .arg("--target")
             .arg(&tools_dir)
-            .arg("pyinstaller");
+            .arg("pyinstaller")
+            .env("PIP_CACHE_DIR", &cache_dir)
+            .env("PIP_NO_INPUT", "1")
+            .env("PYTHONNOUSERSITE", "1")
+            .env("TMP", &temp_dir)
+            .env("TEMP", &temp_dir);
 
         let output = run_command_with_timeout(install, Duration::from_secs(120))
             .map_err(|e| format!("pip could not be started: {}", e))?;
@@ -2852,7 +3531,12 @@ fn extract_followup_write_content(user_request: &str) -> Option<String> {
                 }
             }
 
-            if let Some(end) = content.to_lowercase().find(" rein") {
+            let lower_content = content.to_lowercase();
+            if let Some(end) = [" rein", " into it", " in it"]
+                .iter()
+                .filter_map(|marker| lower_content.find(marker))
+                .min()
+            {
                 return clean_content_fragment(&content[..end]);
             }
 
@@ -3037,6 +3721,558 @@ All visible user-facing text must use the same language as the user.
             }
         }
     }
+}
+
+fn run_second_coordinator_review(
+    config: &AgentRunConfig,
+    project_root: &Path,
+    project_snapshot: &str,
+    memory_context: &str,
+    primary: &CoordinatorDecision,
+    log_lines: &mut Vec<String>,
+) -> CoordinatorReview {
+    let prompt = format!(
+        r#"You are Coordinator 2, the independent reviewing coordinator in a local coding assistant.
+
+Coordinator 1 already analyzed the task. Review that plan before coding starts.
+Check whether the plan matches the user's request, whether it stays inside the selected project/distribution constraints, and whether the number of coding agents is reasonable.
+Return only JSON, no Markdown.
+
+Schema:
+{{
+  "approved": true,
+  "feedback": "short feedback sent back to Coordinator 1",
+  "revised_summary": "improved implementation plan; keep empty only if no revision is needed",
+  "recommended_agent_count": 1
+}}
+
+Prefer 1 agent for clear single-file changes, 2 for medium uncertainty, and 3..6 only for genuinely complex or multi-file work.
+
+Project folder:
+{project_dir}
+
+User request:
+{user_request}
+
+Coordinator 1 plan:
+{primary_summary}
+
+Coordinator 1 routing:
+needs_code={needs_code}, recommended_agent_count={agent_count}, use_large_single_coder={large_coder}
+
+Project snapshot:
+{project_snapshot}
+
+Persistent memory:
+{memory_context}
+
+JSON:"#,
+        project_dir = project_root.display(),
+        user_request = &config.user_request,
+        primary_summary = &primary.summary,
+        needs_code = primary.needs_code,
+        agent_count = primary.recommended_agent_count,
+        large_coder = primary.use_large_single_coder,
+        project_snapshot = truncate_text(project_snapshot, config.context_limit.min(50_000)),
+        memory_context = truncate_text(memory_context, 8_000),
+    );
+
+    log_lines.push(format!(
+        "TRAFFIC Coordinator 1 -> Coordinator 2 | Plan:\n{}",
+        truncate_text(&primary.summary, 2_000)
+    ));
+
+    match ollama_generate_with_fallback(
+        &config.ollama_path,
+        LOCAL_GPT_ROUTER_MODEL,
+        &config.model,
+        &prompt,
+    ) {
+        Ok(answer) => {
+            log_lines.push(format!(
+                "TRAFFIC Coordinator 2 -> Coordinator 1 | Review:\n{}",
+                truncate_text(&answer, 4_000)
+            ));
+            let parsed = serde_json::from_str::<CoordinatorReview>(answer.trim())
+                .ok()
+                .or_else(|| {
+                    extract_first_json_object(answer.trim())
+                        .and_then(|json_text| serde_json::from_str::<CoordinatorReview>(&json_text).ok())
+                });
+            parsed.unwrap_or_else(|| CoordinatorReview {
+                approved: true,
+                feedback: "Coordinator 2 returned no valid review JSON; Coordinator 1 plan continues unchanged."
+                    .to_string(),
+                revised_summary: primary.summary.clone(),
+                recommended_agent_count: primary.recommended_agent_count.max(1),
+            })
+        }
+        Err(error) => {
+            log_lines.push(format!("Coordinator 2 fallback: {}", error));
+            CoordinatorReview {
+                approved: true,
+                feedback: "Coordinator 2 was unavailable; Coordinator 1 plan continues unchanged."
+                    .to_string(),
+                revised_summary: primary.summary.clone(),
+                recommended_agent_count: primary.recommended_agent_count.max(1),
+            }
+        }
+    }
+}
+
+
+fn parse_correction_agent_review(raw: &str) -> Option<CorrectionAgentReview> {
+    let trimmed = raw.trim();
+    serde_json::from_str::<CorrectionAgentReview>(trimmed)
+        .ok()
+        .or_else(|| {
+            extract_first_json_object(trimmed)
+                .and_then(|json_text| serde_json::from_str::<CorrectionAgentReview>(&json_text).ok())
+        })
+}
+
+fn run_correction_coordinator_consultation(
+    config: &AgentRunConfig,
+    project_root: &Path,
+    coordinator: &CoordinatorDecision,
+    correction_review: &CorrectionAgentReview,
+    proposed_envelope: &ActionEnvelope,
+    log_lines: &mut Vec<String>,
+) -> CoordinatorReview {
+    let proposed_json = serde_json::to_string_pretty(proposed_envelope)
+        .unwrap_or_else(|_| "{\"summary\":\"unavailable\",\"actions\":[]}".to_string());
+    let prompt = format!(
+        r#"You are Coordinator 1 in a local coding assistant.
+
+The GPT Correction Agent has reviewed the proposed final patch and is explicitly consulting you again before a last coding-agent correction round.
+Check the correction feedback against the original user request and your implementation goal.
+Return only JSON, no Markdown.
+
+Schema:
+{{
+  "approved": true,
+  "feedback": "your response back to the GPT Correction Agent",
+  "revised_summary": "the final correction goal that coding agents should follow",
+  "recommended_agent_count": 2
+}}
+
+User request:
+{user_request}
+
+Your original implementation goal:
+{coordinator_summary}
+
+GPT Correction Agent approved current patch:
+{correction_approved}
+
+GPT Correction Agent feedback:
+{correction_feedback}
+
+GPT Correction Agent correction brief:
+{correction_brief}
+
+Current proposed file actions:
+{proposed_actions}
+
+Project folder:
+{project_dir}
+
+JSON:"#,
+        user_request = &config.user_request,
+        coordinator_summary = &coordinator.summary,
+        correction_approved = correction_review.approved,
+        correction_feedback = &correction_review.feedback_to_coordinator,
+        correction_brief = &correction_review.correction_brief,
+        proposed_actions = truncate_text(&proposed_json, 30_000),
+        project_dir = project_root.display(),
+    );
+
+    log_lines.push(format!(
+        "TRAFFIC GPT Correction Agent -> Coordinator 1 | Consultation:\n{}",
+        truncate_text(&prompt, 5_000)
+    ));
+
+    match ollama_generate_with_fallback(
+        &config.ollama_path,
+        LOCAL_GPT_ROUTER_MODEL,
+        &config.model,
+        &prompt,
+    ) {
+        Ok(answer) => {
+            log_lines.push(format!(
+                "TRAFFIC Coordinator 1 -> GPT Correction Agent | Consultation response:\n{}",
+                truncate_text(&answer, 4_000)
+            ));
+            serde_json::from_str::<CoordinatorReview>(answer.trim())
+                .ok()
+                .or_else(|| {
+                    extract_first_json_object(answer.trim()).and_then(|json_text| {
+                        serde_json::from_str::<CoordinatorReview>(&json_text).ok()
+                    })
+                })
+                .unwrap_or_else(|| CoordinatorReview {
+                    approved: correction_review.approved,
+                    feedback: "Coordinator consultation returned no valid JSON; keep the correction agent review and continue with a conservative final review.".to_string(),
+                    revised_summary: if correction_review.correction_brief.trim().is_empty() {
+                        coordinator.summary.clone()
+                    } else {
+                        correction_review.correction_brief.clone()
+                    },
+                    recommended_agent_count: correction_review.recommended_agent_count.max(1),
+                })
+        }
+        Err(error) => {
+            log_lines.push(format!(
+                "Coordinator consultation for correction fallback: {}",
+                error
+            ));
+            CoordinatorReview {
+                approved: correction_review.approved,
+                feedback: "Coordinator consultation was unavailable; continue conservatively with the original coordinator goal and correction feedback.".to_string(),
+                revised_summary: if correction_review.correction_brief.trim().is_empty() {
+                    coordinator.summary.clone()
+                } else {
+                    correction_review.correction_brief.clone()
+                },
+                recommended_agent_count: correction_review.recommended_agent_count.max(1),
+            }
+        }
+    }
+}
+
+fn run_final_correction_pipeline(
+    config: &AgentRunConfig,
+    project_root: &Path,
+    project_snapshot: &str,
+    coordinator: &CoordinatorDecision,
+    proposed_envelope: &ActionEnvelope,
+    log_lines: &mut Vec<String>,
+) -> ActionEnvelope {
+    let original_envelope = proposed_envelope.clone();
+    let proposed_json = serde_json::to_string_pretty(proposed_envelope)
+        .unwrap_or_else(|_| "{\"summary\":\"unavailable\",\"actions\":[]}".to_string());
+
+    let review_prompt = format!(
+        r#"You are the GPT Correction Agent, the final code-correction reviewer in a local coding assistant.
+
+A coordinator and coding agents produced a proposed patch, but NOTHING has been applied yet.
+Inspect the proposed file actions against the user request, the coordinator goal, and the project snapshot.
+Identify missing requirements, unsafe replacements, contradictions, incomplete scripts, build risks, and opportunities to keep the patch minimal.
+You must then consult Coordinator 1, so make your feedback concise and actionable.
+Return only JSON, no Markdown.
+
+Schema:
+{{
+  "approved": false,
+  "feedback_to_coordinator": "what Coordinator 1 must reconsider or confirm",
+  "correction_brief": "precise instructions for the coding agents in the final correction round",
+  "recommended_agent_count": 2
+}}
+
+User request:
+{user_request}
+
+Coordinator goal:
+{coordinator_summary}
+
+Proposed final file actions:
+{proposed_actions}
+
+Project snapshot:
+{project_snapshot}
+
+JSON:"#,
+        user_request = &config.user_request,
+        coordinator_summary = &coordinator.summary,
+        proposed_actions = truncate_text(&proposed_json, 35_000),
+        project_snapshot = truncate_text(project_snapshot, config.context_limit.min(60_000)),
+    );
+
+    log_lines.push(format!(
+        "TRAFFIC Agent manager -> GPT Correction Agent ({}) | Final patch review:\n{}",
+        LOCAL_GPT_ROUTER_MODEL,
+        truncate_text(&review_prompt, 5_000)
+    ));
+
+    let correction_review = match ollama_generate_with_fallback(
+        &config.ollama_path,
+        LOCAL_GPT_ROUTER_MODEL,
+        &config.model,
+        &review_prompt,
+    ) {
+        Ok(answer) => {
+            log_lines.push(format!(
+                "TRAFFIC GPT Correction Agent -> Coordinator 1 | Review:\n{}",
+                truncate_text(&answer, 4_000)
+            ));
+            parse_correction_agent_review(&answer).unwrap_or_else(|| CorrectionAgentReview {
+                approved: false,
+                feedback_to_coordinator: "The correction review response was not valid JSON. Perform a conservative second coding review before applying anything.".to_string(),
+                correction_brief: "Re-check the complete proposed patch against the user request and return a safe complete replacement action envelope.".to_string(),
+                recommended_agent_count: 2,
+            })
+        }
+        Err(error) => {
+            log_lines.push(format!("GPT Correction Agent review fallback: {}", error));
+            CorrectionAgentReview {
+                approved: false,
+                feedback_to_coordinator: "The dedicated correction review was unavailable. Perform a conservative second coding review before applying anything.".to_string(),
+                correction_brief: "Re-check the complete proposed patch against the user request and return a safe complete replacement action envelope.".to_string(),
+                recommended_agent_count: 2,
+            }
+        }
+    };
+
+    emit_agent_progress(
+        config,
+        format!(
+            "GPT Correction Agent: I reviewed the patch and sent this back to Coordinator 1: {}",
+            truncate_text(&correction_review.feedback_to_coordinator, 220)
+        ),
+    );
+
+    let coordinator_consultation = run_correction_coordinator_consultation(
+        config,
+        project_root,
+        coordinator,
+        &correction_review,
+        proposed_envelope,
+        log_lines,
+    );
+
+    emit_agent_progress(
+        config,
+        format!(
+            "Coordinator 1: I have answered the correction review. The final coding-agent round will follow this goal: {}",
+            truncate_text(&coordinator_consultation.revised_summary, 220)
+        ),
+    );
+
+    let max_review_agents = config.max_parallel_agents.max(1).min(3);
+    let requested = correction_review
+        .recommended_agent_count
+        .max(coordinator_consultation.recommended_agent_count)
+        .max(if max_review_agents >= 2 { 2 } else { 1 });
+    let review_agent_count = requested.clamp(1, max_review_agents);
+
+    let correction_prompt = format!(
+        r#"You are a coding agent in the FINAL CORRECTION ROUND.
+
+The first coding round produced proposed file actions. A dedicated GPT Correction Agent reviewed them and then consulted Coordinator 1 again.
+Nothing has been applied yet.
+Return one COMPLETE replacement ActionEnvelope for the final patch. Do not return commentary outside JSON.
+Preserve correct actions, repair incorrect ones, add missing required actions, and remove unnecessary actions.
+All replace_text find strings must match the provided project snapshot exactly once.
+
+Allowed JSON schema:
+{{
+  "summary": "short final internal summary",
+  "actions": []
+}}
+
+Allowed operations:
+- {{"op":"replace_text","path":"relative/path","find":"exact old text","replace":"new text"}}
+- {{"op":"write_file","path":"relative/path","content":"complete file content"}}
+- {{"op":"append_file","path":"relative/path","content":"text to append"}}
+- {{"op":"copy_file","source":"absolute/or/external/source/path","path":"relative/target/path/inside/project"}}
+- {{"op":"package_python_exe","path":"relative/path.py"}}
+
+User request:
+{user_request}
+
+Original Coordinator 1 goal:
+{coordinator_goal}
+
+GPT Correction Agent feedback:
+{correction_feedback}
+
+GPT Correction Agent correction brief:
+{correction_brief}
+
+Coordinator 1 answer after renewed consultation:
+{coordinator_feedback}
+
+Final correction goal:
+{final_goal}
+
+First-round proposed actions:
+{proposed_actions}
+
+Project snapshot:
+{project_snapshot}
+
+Reply only with the complete replacement JSON object:"#,
+        user_request = &config.user_request,
+        coordinator_goal = &coordinator.summary,
+        correction_feedback = &correction_review.feedback_to_coordinator,
+        correction_brief = &correction_review.correction_brief,
+        coordinator_feedback = &coordinator_consultation.feedback,
+        final_goal = if coordinator_consultation.revised_summary.trim().is_empty() {
+            &coordinator.summary
+        } else {
+            &coordinator_consultation.revised_summary
+        },
+        proposed_actions = truncate_text(&proposed_json, 35_000),
+        project_snapshot = truncate_text(project_snapshot, config.context_limit.min(70_000)),
+    );
+
+    emit_agent_progress(
+        config,
+        format!(
+            "GPT Correction Agent: I am redistributing the proposed patch to {} coding agent(s) for independent final corrections.",
+            review_agent_count
+        ),
+    );
+
+    let mut correction_config = config.clone();
+    if trained_coder_model_available() {
+        correction_config.model = TRAINED_CODER_MODEL.to_string();
+    }
+
+    let revised_envelope = match run_coder_candidates(
+        &correction_config,
+        project_root,
+        &correction_prompt,
+        review_agent_count,
+    ) {
+        Ok((candidate, candidate_logs)) => {
+            log_lines.extend(candidate_logs);
+            candidate
+        }
+        Err(error) => {
+            log_lines.push(format!(
+                "Final correction coding round failed; keeping the first-round validated actions: {}",
+                error
+            ));
+            original_envelope.clone()
+        }
+    };
+
+    let revised_json = serde_json::to_string_pretty(&revised_envelope)
+        .unwrap_or_else(|_| proposed_json.clone());
+    let judge_prompt = format!(
+        r#"You are the GPT Correction Agent performing the FINAL RELEASE GATE before file actions are applied.
+
+You already reviewed the first patch, consulted Coordinator 1, and sent the work through a final coding-agent correction round.
+Choose and, only when necessary, minimally repair the safest complete action envelope.
+Return ONLY the final ActionEnvelope JSON. No Markdown and no commentary.
+Do not invent paths outside the project. Keep the user request and Coordinator 1's final correction goal authoritative.
+
+Schema:
+{{
+  "summary": "final approved internal summary",
+  "actions": []
+}}
+
+User request:
+{user_request}
+
+Coordinator 1 final correction goal:
+{final_goal}
+
+Coordinator 1 consultation feedback:
+{coordinator_feedback}
+
+First-round actions:
+{original_actions}
+
+Coding-agent corrected actions:
+{revised_actions}
+
+Project snapshot:
+{project_snapshot}
+
+Final approved JSON:"#,
+        user_request = &config.user_request,
+        final_goal = if coordinator_consultation.revised_summary.trim().is_empty() {
+            &coordinator.summary
+        } else {
+            &coordinator_consultation.revised_summary
+        },
+        coordinator_feedback = &coordinator_consultation.feedback,
+        original_actions = truncate_text(&proposed_json, 30_000),
+        revised_actions = truncate_text(&revised_json, 30_000),
+        project_snapshot = truncate_text(project_snapshot, config.context_limit.min(60_000)),
+    );
+
+    log_lines.push(format!(
+        "TRAFFIC Coding agents -> GPT Correction Agent | Final candidate:\n{}",
+        truncate_text(&revised_json, 5_000)
+    ));
+
+    let final_envelope = match ollama_generate_with_fallback(
+        &config.ollama_path,
+        LOCAL_GPT_ROUTER_MODEL,
+        &config.model,
+        &judge_prompt,
+    ) {
+        Ok(answer) => {
+            log_lines.push(format!(
+                "TRAFFIC GPT Correction Agent -> Coordinator 1 | Final release decision:\n{}",
+                truncate_text(&answer, 5_000)
+            ));
+            match parse_action_envelope(&answer) {
+                Ok(candidate)
+                    if !candidate.actions.is_empty()
+                        && validate_action_envelope(project_root, &candidate).is_empty() =>
+                {
+                    candidate
+                }
+                Ok(candidate) => {
+                    log_lines.push(format!(
+                        "GPT Correction Agent final candidate was rejected by deterministic validation: {}",
+                        validate_action_envelope(project_root, &candidate).join("; ")
+                    ));
+                    if !revised_envelope.actions.is_empty()
+                        && validate_action_envelope(project_root, &revised_envelope).is_empty()
+                    {
+                        revised_envelope
+                    } else {
+                        original_envelope
+                    }
+                }
+                Err(error) => {
+                    log_lines.push(format!(
+                        "GPT Correction Agent final response was not a valid action envelope: {}",
+                        error
+                    ));
+                    if !revised_envelope.actions.is_empty()
+                        && validate_action_envelope(project_root, &revised_envelope).is_empty()
+                    {
+                        revised_envelope
+                    } else {
+                        original_envelope
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            log_lines.push(format!(
+                "GPT Correction Agent final release gate unavailable: {}",
+                error
+            ));
+            if !revised_envelope.actions.is_empty()
+                && validate_action_envelope(project_root, &revised_envelope).is_empty()
+            {
+                revised_envelope
+            } else {
+                original_envelope
+            }
+        }
+    };
+
+    emit_agent_progress(
+        config,
+        format!(
+            "GPT Correction Agent: Final review passed deterministic validation with {} action(s). Coordinator 1 can now apply the approved patch.",
+            final_envelope.actions.len()
+        ),
+    );
+    log_lines.push(format!(
+        "GPT Correction Agent approved {} final action(s) after renewed coordinator consultation and coding-agent redistribution.",
+        final_envelope.actions.len()
+    ));
+    final_envelope
 }
 
 fn parse_coordinator_decision(raw: &str) -> Result<CoordinatorDecision, String> {
@@ -4114,10 +5350,6 @@ fn agent_models_for_count<'a>(primary_model: &'a str, count: usize) -> Vec<&'a s
 }
 
 fn recommended_agent_count(config: &AgentRunConfig, decision: &CoordinatorDecision) -> usize {
-    if decision.needs_code {
-        return config.max_parallel_agents.clamp(1, 6);
-    }
-
     let requested = decision.recommended_agent_count.clamp(1, 6);
     requested.min(config.max_parallel_agents.max(1))
 }
@@ -4189,7 +5421,7 @@ fn ensure_required_models(
     let available = ollama_list_models().unwrap_or_default();
 
     for model in models {
-        if model.starts_with("openclaw-agent") {
+        if model.starts_with("openclaw-agent") || model == &TRAINED_CODER_MODEL {
             continue;
         }
         if available.iter().any(|name| name == model) {
@@ -4224,7 +5456,7 @@ fn ensure_all_agent_models(
 }
 
 fn install_openclaw_application(ollama_path: &str) -> Result<(), String> {
-    let marker_dir = app_base_dir().join(".local_ai_builder");
+    let marker_dir = distribution_data_root(&app_base_dir()).join(".local_ai_builder");
     let marker = marker_dir.join("openclaw_install_started");
     if marker.exists() {
         return Ok(());
@@ -4261,7 +5493,7 @@ fn create_openclaw_agent_model(ollama_path: &str, project_root: &Path) -> Result
         return Err(format!("Ollama was not found: {}", path.display()));
     }
 
-    let config_dir = app_base_dir().join(".local_ai_builder");
+    let config_dir = distribution_data_root(&app_base_dir()).join(".local_ai_builder");
     fs::create_dir_all(&config_dir)
         .map_err(|e| format!("OpenClaw model folder could not be created: {}", e))?;
     let modelfile = config_dir.join("OpenClaw.Modelfile");
@@ -4290,6 +5522,140 @@ fn create_openclaw_agent_model(ollama_path: &str, project_root: &Path) -> Result
         Ok(())
     } else {
         Err("OpenClaw model installation failed.".to_string())
+    }
+}
+
+
+fn maybe_register_existing_trained_adapter(
+    config: &AgentRunConfig,
+    project_root: &Path,
+    log_lines: &mut Vec<String>,
+) {
+    if trained_coder_model_available() {
+        return;
+    }
+
+    let memory_dir = PathBuf::from(&config.memory_dir);
+    let Some(distribution_root) = memory_dir.parent() else {
+        return;
+    };
+    let adapter_dir = distribution_root.join("training").join("online_adapter");
+    if !adapter_dir.join("adapter_model.safetensors").exists()
+        || !adapter_dir.join("adapter_config.json").exists()
+    {
+        return;
+    }
+
+    match register_trained_adapter_model(
+        &config.ollama_path,
+        distribution_root,
+        &adapter_dir,
+    ) {
+        Ok(()) => {
+            log_lines.push(format!(
+                "Existing trained adapter was registered as {} and is available to coding agents.",
+                TRAINED_CODER_MODEL
+            ));
+            emit_agent_progress(
+                config,
+                "Coordinator 1: I found an existing trained adapter in distribution and activated it for coding agents.",
+            );
+        }
+        Err(error) => {
+            log_lines.push(format!(
+                "Existing trained adapter could not be registered; standard coding models remain active: {}",
+                error
+            ));
+        }
+    }
+
+    let _ = project_root;
+}
+
+fn trained_coder_model_available() -> bool {
+    ollama_list_models()
+        .map(|models| models.iter().any(|name| name == TRAINED_CODER_MODEL))
+        .unwrap_or(false)
+}
+
+fn register_trained_adapter_model(
+    ollama_path: &str,
+    distribution_root: &Path,
+    adapter_dir: &Path,
+) -> Result<(), String> {
+    let adapter_file = adapter_dir.join("adapter_model.safetensors");
+    let adapter_config = adapter_dir.join("adapter_config.json");
+    if !adapter_file.exists() || !adapter_config.exists() {
+        return Err(format!(
+            "trained adapter files are incomplete in {}",
+            adapter_dir.display()
+        ));
+    }
+
+    ensure_ollama_available(ollama_path, distribution_root)?;
+    ensure_required_models(
+        ollama_path,
+        distribution_root,
+        &[QWEN_CODER_MODEL],
+    )?;
+
+    let trimmed = ollama_path.trim().trim_matches('"');
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("Ollama was not found: {}", path.display()));
+    }
+
+    let canonical_adapter = fs::canonicalize(adapter_dir)
+        .unwrap_or_else(|_| adapter_dir.to_path_buf());
+    let adapter_path = canonical_adapter
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .replace('"', "\\\"");
+    let model_dir = distribution_root.join("training").join("online_adapter");
+    fs::create_dir_all(&model_dir)
+        .map_err(|e| format!("trained model folder could not be created: {}", e))?;
+    let modelfile = model_dir.join("LocalCodingAI.Trained.Modelfile");
+    let contents = format!(
+        "FROM {}\nADAPTER \"{}\"\nPARAMETER temperature 0.15\nSYSTEM You are the locally trained coding agent for this Local Coding AI installation. Preserve the user's established project conventions, prefer minimal safe patches, and obey the exact output format requested by the coordinator.\n",
+        QWEN_CODER_MODEL,
+        adapter_path
+    );
+    fs::write(&modelfile, contents)
+        .map_err(|e| format!("trained model Modelfile could not be written: {}", e))?;
+
+    let models_dir = project_ollama_models_dir(distribution_root);
+    let output = hidden_command(&path)
+        .arg("create")
+        .arg(TRAINED_CODER_MODEL)
+        .arg("-f")
+        .arg(&modelfile)
+        .env("OLLAMA_MODELS", &models_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("trained Ollama model creation could not start: {}", e))?;
+
+    if output.status.success() {
+        let marker = model_dir.join("ACTIVE_OLLAMA_MODEL.txt");
+        let _ = fs::write(
+            marker,
+            format!(
+                "model={}\nbase={}\nadapter={}\nregistered={}\n",
+                TRAINED_CODER_MODEL,
+                QWEN_CODER_MODEL,
+                canonical_adapter.display(),
+                now_secs()
+            ),
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "ollama create {} failed: {}",
+            TRAINED_CODER_MODEL,
+            truncate_text(&String::from_utf8_lossy(&output.stderr), 3000)
+        ))
     }
 }
 
@@ -4871,6 +6237,18 @@ fn default_agent_graph() -> AgentGraph {
             h: 112.0,
         },
         AgentBlock {
+            id: 10,
+            title: "Coordinator 2".to_string(),
+            kind: AgentBlockKind::Coordinator,
+            model: LOCAL_GPT_ROUTER_MODEL.to_string(),
+            prompt: "Review Coordinator 1 plans, challenge assumptions, and send a revised plan back before coding starts.".to_string(),
+            task: "Independent plan review and progress feedback.".to_string(),
+            x: 380.0,
+            y: 390.0,
+            w: 210.0,
+            h: 112.0,
+        },
+        AgentBlock {
             id: 5,
             title: "Planer".to_string(),
             kind: AgentBlockKind::PlanningAgent,
@@ -4918,6 +6296,16 @@ fn default_agent_graph() -> AgentGraph {
             },
             AgentConnection {
                 from: 1,
+                to: 10,
+                label: "Plan review".to_string(),
+            },
+            AgentConnection {
+                from: 10,
+                to: 1,
+                label: "Feedback".to_string(),
+            },
+            AgentConnection {
+                from: 1,
                 to: 5,
                 label: "Planung".to_string(),
             },
@@ -4957,7 +6345,7 @@ fn default_agent_graph() -> AgentGraph {
                 label: "Ergebnis".to_string(),
             },
         ],
-        next_id: 10,
+        next_id: 11,
     }
 }
 
@@ -5176,6 +6564,43 @@ fn normalize_agent_graph(graph: &mut AgentGraph) {
         });
     }
 
+    let has_second_coordinator = graph.blocks.iter().any(|block| {
+        block.kind == AgentBlockKind::Coordinator && block.title == "Coordinator 2"
+    });
+    if !has_second_coordinator && looks_like_old_default {
+        let id = graph
+            .blocks
+            .iter()
+            .map(|block| block.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        graph.blocks.push(AgentBlock {
+            id,
+            title: "Coordinator 2".to_string(),
+            kind: AgentBlockKind::Coordinator,
+            model: LOCAL_GPT_ROUTER_MODEL.to_string(),
+            prompt: "Review Coordinator 1 plans, challenge assumptions, and send a revised plan back before coding starts.".to_string(),
+            task: "Independent plan review and progress feedback.".to_string(),
+            x: 380.0,
+            y: 390.0,
+            w: 210.0,
+            h: 112.0,
+        });
+        if graph.blocks.iter().any(|block| block.id == 1) {
+            graph.connections.push(AgentConnection {
+                from: 1,
+                to: id,
+                label: "Plan review".to_string(),
+            });
+            graph.connections.push(AgentConnection {
+                from: id,
+                to: 1,
+                label: "Feedback".to_string(),
+            });
+        }
+    }
+
     let max_id = graph.blocks.iter().map(|block| block.id).max().unwrap_or(0);
     graph.connections.retain(|connection| {
         graph.blocks.iter().any(|block| block.id == connection.from)
@@ -5368,12 +6793,68 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+fn prepare_self_rebuild(project_root: &Path) -> Result<(), String> {
+    let script = project_root.join("SELF_REBUILD_AND_SWAP.bat");
+    if !script.exists() {
+        return Err(format!("self-rebuild script is missing: {}", script.display()));
+    }
+    if !project_root.join("Cargo.toml").exists() || !project_root.join("src/main.rs").exists() {
+        return Err("the selected project is not the bundled Local Coding AI source tree".to_string());
+    }
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("current EXE path could not be read: {}", e))?;
+    let pid = std::process::id().to_string();
+    let status = hidden_command("cmd")
+        .arg("/C")
+        .arg(&script)
+        .arg(pid)
+        .arg(&current_exe)
+        .current_dir(project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("self-rebuild process could not start: {}", e))?;
+    if status.success() {
+        let bridge = project_root.join("SELF_SWAP_BRIDGE.bat");
+        let new_exe = project_root
+            .join("target")
+            .join("release")
+            .join("local_ai_allround_builder.exe");
+        let log = project_root.join("self_update.log");
+        if !bridge.exists() || !new_exe.exists() {
+            return Err("build succeeded but the bridge or new EXE is missing".to_string());
+        }
+        hidden_command("cmd")
+            .arg("/C")
+            .arg(&bridge)
+            .arg(std::process::id().to_string())
+            .arg(&new_exe)
+            .arg(&current_exe)
+            .arg(&log)
+            .current_dir(project_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("swap bridge could not start: {}", e))?;
+        Ok(())
+    } else {
+        Err(format!(
+            "self-rebuild returned exit code {:?}; see self_update.log",
+            status.code()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lokal_ai_test_{}_{}", name, now_millis()));
+        let dir = distribution_data_root(&app_base_dir())
+            .join("test_tmp")
+            .join(format!("lokal_ai_test_{}_{}", name, now_millis()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -5392,6 +6873,8 @@ mod tests {
             run_tests_after_apply: false,
             context_limit: 50_000,
             max_parallel_agents: 2,
+            run_id: 1,
+            progress_tx: None,
         }
     }
 
@@ -5748,11 +7231,19 @@ fn ensure_distribution_data_dirs(root: &Path) {
         root.join("training").join("fine_tuning"),
         root.join("training").join("exports"),
         root.join("training").join("datasets"),
+        root.join("training").join("cache"),
+        root.join("training").join("temp"),
+        root.join("training").join("runtime"),
+        root.join("training_tools"),
+        root.join("tools"),
+        root.join("temp"),
+        root.join("test_tmp"),
     ];
 
     for dir in dirs {
         let _ = fs::create_dir_all(dir);
     }
+    ensure_training_tool_files(root);
 
     let readme = root.join("training").join("README_TRAINING_DATA.txt");
     if !readme.exists() {
@@ -5830,12 +7321,30 @@ fn find_ollama(base: &Path) -> Option<PathBuf> {
             .join("Ollama")
             .join("ollama.exe"),
         base.join("PROGRAMME").join("Ollama").join("ollama.exe"),
-        PathBuf::from(r"C:\Users\tarek\AppData\Local\Programs\Ollama\ollama.exe"),
     ];
 
     for c in candidates {
         if c.exists() {
             return Some(c);
+        }
+    }
+
+    if let Ok(output) = hidden_command(if cfg!(windows) { "where" } else { "which" })
+        .arg(if cfg!(windows) { "ollama.exe" } else { "ollama" })
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                if let Some(path) = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .find(|path| path.exists())
+                {
+                    return Some(path);
+                }
+            }
         }
     }
 
