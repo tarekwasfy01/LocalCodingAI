@@ -26,7 +26,7 @@
 The easiest option is the single-file installer:
 
 ```text
-DISTRIBUTION/ONE_FILE_INSTALLER/Local Coding AI Installer.exe
+DISTRIBUTION/ONE_FILE_INSTALLER/Local Coding AI.exe
 ```
 
 The installer:
