@@ -306,7 +306,7 @@ impl Default for LocalAiApp {
             show_agent_progress: true,
             auto_apply_actions: true,
             run_tests_after_apply: false,
-            max_parallel_agents: "2".to_string(),
+            max_parallel_agents: "6".to_string(),
         };
         app.log(format!("Ollama: {}", app.ollama_path));
         app
@@ -1197,7 +1197,7 @@ impl LocalAiApp {
                 &status_file,
                 &format!("[{}] starting one-step LoRA training\n", started),
             );
-            let result = Command::new("python")
+            let result = hidden_command("python")
                 .arg(&script)
                 .arg("--dataset")
                 .arg(&dataset)
@@ -1667,7 +1667,7 @@ fn run_agent_chain(config: AgentRunConfig) -> AgentResult {
         effective_agent_count, coordinator.use_large_single_coder
     ));
 
-    let primary_coder_model = if coordinator.use_large_single_coder {
+    let primary_coder_model = if coordinator.use_large_single_coder && effective_agent_count == 1 {
         LOCAL_GPT_ROUTER_MODEL
     } else {
         config.model.as_str()
@@ -1778,15 +1778,67 @@ JSON:"#,
                 "Agent manager could not create actions: {}",
                 e
             ));
-            return AgentResult {
-                final_answer: coordinator_direct_fallback(
-                    &config.user_request,
-                    "I could not run a file change because the local model did not respond. Tell me if I should try again; the project folder was left unchanged.",
-                ),
-                log_lines,
-            };
+            match run_emergency_coder(
+                &config,
+                &project_root,
+                &project_snapshot,
+                &coordinator.summary,
+                &mut log_lines,
+            ) {
+                Ok(envelope) => envelope,
+                Err(emergency_error) => {
+                    log_lines.push(format!("Emergency coding fallback failed: {}", emergency_error));
+                    return AgentResult {
+                        final_answer: coordinator_direct_fallback(
+                            &config.user_request,
+                            "The GPT and Qwen coding attempts did not produce a safe applicable change. The project folder was left unchanged.",
+                        ),
+                        log_lines,
+                    };
+                }
+            }
         }
     };
+
+    if coordinator.needs_code && envelope.actions.is_empty() {
+        log_lines.push(
+            "Empty actions are not accepted for this requested file change; GPT Coding Agent retries."
+                .to_string(),
+        );
+        let retry_prompt = format!(
+            "{}\n\nCRITICAL RETRY RULE:\nThe user explicitly requested a project change. The previous coder returned no actions. You MUST inspect the snapshot and return at least one safe write_file or replace_text action that implements the request. Do not claim it is already addressed unless the requested functionality is visibly present in the snapshot.",
+            coder_prompt
+        );
+        let mut retry_config = config.clone();
+        retry_config.model = LOCAL_GPT_ROUTER_MODEL.to_string();
+        match run_coder_candidates(&retry_config, &project_root, &retry_prompt, 1) {
+            Ok((retry_envelope, retry_logs)) if !retry_envelope.actions.is_empty() => {
+                log_lines.extend(retry_logs);
+                envelope = retry_envelope;
+            }
+            Ok((_, retry_logs)) => {
+                log_lines.extend(retry_logs);
+                log_lines.push("GPT Coding Agent also returned no file actions.".to_string());
+                return AgentResult {
+                    final_answer: coordinator_direct_fallback(
+                        &config.user_request,
+                        "The coding models returned no applicable file change. The project folder was left unchanged.",
+                    ),
+                    log_lines,
+                };
+            }
+            Err(error) => {
+                log_lines.push(format!("GPT Coding Agent retry failed: {}", error));
+                return AgentResult {
+                    final_answer: coordinator_direct_fallback(
+                        &config.user_request,
+                        "The GPT coding retry failed. The project folder was left unchanged.",
+                    ),
+                    log_lines,
+                };
+            }
+        }
+    }
 
     if let Some(summary) = envelope.summary.as_ref().filter(|s| !s.trim().is_empty()) {
         log_lines.push(format!(
@@ -2472,7 +2524,7 @@ fn find_python_runtime() -> Result<PythonRuntime, String> {
 }
 
 fn python_command(runtime: &PythonRuntime) -> Command {
-    let mut command = Command::new(&runtime.program);
+    let mut command = hidden_command(&runtime.program);
     command.args(&runtime.prefix_args);
     command
 }
@@ -2596,7 +2648,7 @@ fn run_command_with_timeout(
 }
 
 fn run_exe_smoke_test(exe_path: &Path, project_root: &Path, timeout: Duration) -> String {
-    let mut child = match Command::new(exe_path)
+    let mut child = match hidden_command(exe_path)
         .current_dir(project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3300,6 +3352,74 @@ fn run_coder_candidates(
     Err(first_error.unwrap_or_else(|| "Kein Coding-Agent lieferte sichere Actions.".to_string()))
 }
 
+fn run_emergency_coder(
+    config: &AgentRunConfig,
+    project_root: &Path,
+    project_snapshot: &str,
+    goal: &str,
+    logs: &mut Vec<String>,
+) -> Result<ActionEnvelope, String> {
+    let prompt = format!(
+        r#"Implement the requested project change now.
+Return only one JSON object with this exact shape:
+{{"summary":"short summary","actions":[{{"op":"write_file","path":"relative/file","content":"complete updated file"}}]}}
+
+Rules:
+- At least one action is required.
+- Prefer write_file with the complete updated content when the project is small.
+- Paths must be relative to the project folder.
+- No Markdown and no prose outside JSON.
+
+User request:
+{request}
+
+Goal:
+{goal}
+
+Project snapshot:
+{snapshot}
+
+JSON:"#,
+        request = config.user_request,
+        goal = goal,
+        snapshot = truncate_text(project_snapshot, config.context_limit.min(40_000)),
+    );
+
+    let mut errors = Vec::new();
+    for model in [LOCAL_GPT_ROUTER_MODEL, QWEN_CODER_MODEL] {
+        logs.push(format!("Emergency coder -> {}", model));
+        match ollama_generate(&config.ollama_path, model, &prompt) {
+            Ok(raw) => {
+                logs.push(format!(
+                    "Emergency coder {} response:\n{}",
+                    model,
+                    truncate_text(&raw, 4_000)
+                ));
+                match parse_action_envelope(&raw) {
+                    Ok(envelope) => {
+                        let validation = validate_action_envelope(project_root, &envelope);
+                        if validation.is_empty() && !envelope.actions.is_empty() {
+                            return Ok(envelope);
+                        }
+                        errors.push(format!(
+                            "{} returned unusable actions: {}",
+                            model,
+                            if validation.is_empty() {
+                                "empty action list".to_string()
+                            } else {
+                                validation.join("; ")
+                            }
+                        ));
+                    }
+                    Err(error) => errors.push(format!("{} JSON parse: {}", model, error)),
+                }
+            }
+            Err(error) => errors.push(format!("{} request: {}", model, error)),
+        }
+    }
+    Err(errors.join(" | "))
+}
+
 fn empty_action_envelope() -> ActionEnvelope {
     ActionEnvelope {
         summary: Some("No safe file change created.".to_string()),
@@ -3994,8 +4114,8 @@ fn agent_models_for_count<'a>(primary_model: &'a str, count: usize) -> Vec<&'a s
 }
 
 fn recommended_agent_count(config: &AgentRunConfig, decision: &CoordinatorDecision) -> usize {
-    if decision.use_large_single_coder {
-        return 1;
+    if decision.needs_code {
+        return config.max_parallel_agents.clamp(1, 6);
     }
 
     let requested = decision.recommended_agent_count.clamp(1, 6);
@@ -4041,7 +4161,7 @@ fn ensure_ollama_available(ollama_path: &str, project_root: &Path) -> Result<(),
     fs::create_dir_all(&models_dir)
         .map_err(|e| format!("Model folder could not be created: {}", e))?;
 
-    Command::new(&path)
+    hidden_command(&path)
         .arg("serve")
         .env("OLLAMA_NUM_GPU", "0")
         .env("OLLAMA_MODELS", &models_dir)
@@ -4117,7 +4237,7 @@ fn install_openclaw_application(ollama_path: &str) -> Result<(), String> {
     fs::create_dir_all(&marker_dir)
         .map_err(|e| format!("OpenClaw installation folder could not be created: {}", e))?;
 
-    Command::new(&path)
+    hidden_command(&path)
         .arg("launch")
         .arg("openclaw")
         .arg("--model")
@@ -4156,7 +4276,7 @@ fn create_openclaw_agent_model(ollama_path: &str, project_root: &Path) -> Result
     .map_err(|e| format!("OpenClaw Modelfile could not be written: {}", e))?;
 
     let models_dir = project_ollama_models_dir(project_root);
-    let status = Command::new(&path)
+    let status = hidden_command(&path)
         .arg("create")
         .arg(OPENCLAW_AGENT_MODEL)
         .arg("-f")
@@ -4227,7 +4347,7 @@ fn ollama_pull_model(ollama_path: &str, project_root: &Path, model: &str) -> Res
     fs::create_dir_all(&models_dir)
         .map_err(|e| format!("Model folder could not be created: {}", e))?;
 
-    let status = Command::new(&path)
+    let status = hidden_command(&path)
         .arg("pull")
         .arg(model)
         .env("OLLAMA_MODELS", &models_dir)
@@ -4930,7 +5050,7 @@ fn block_color(kind: &AgentBlockKind, selected: bool) -> egui::Color32 {
 fn graph_to_python_code(graph: &AgentGraph) -> String {
     let json = serde_json::to_string_pretty(graph).unwrap_or_else(|_| "{}".to_string());
     format!(
-        r#"# Lokal AI Agent Graph
+        r#"# Local Coding AI Agent Graph
 # Edit either this code or the blocks. The JSON section is the source for re-import.
 
 AGENT_GRAPH_JSON = r'''
@@ -5236,6 +5356,16 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -5551,11 +5681,11 @@ mod tests {
 
 fn run_shell(dir: &str, cmd: &str) -> String {
     let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
+        let mut command = hidden_command("cmd");
         command.arg("/C").arg(cmd);
         command
     } else {
-        let mut command = Command::new("sh");
+        let mut command = hidden_command("sh");
         command.arg("-c").arg(cmd);
         command
     };
@@ -5587,7 +5717,10 @@ fn app_base_dir() -> PathBuf {
 }
 
 fn distribution_data_root(base: &Path) -> PathBuf {
-    if base.join("runtime").exists() || base.join("Lokal_AI.exe").exists() {
+    if base.join("runtime").exists()
+        || base.join("Local Coding AI.exe").exists()
+        || base.join("Lokal_AI.exe").exists()
+    {
         return base.to_path_buf();
     }
 
@@ -5731,13 +5864,13 @@ fn load_app_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Lokal AI")
+            .with_title("Local Coding AI")
             .with_icon(load_app_icon()),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Lokal AI",
+        "Local Coding AI",
         options,
         Box::new(|_cc| Ok(Box::new(LocalAiApp::default()))),
     )
